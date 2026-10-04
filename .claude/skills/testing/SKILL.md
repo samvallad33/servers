@@ -26,8 +26,7 @@ when they land. Do not write a test that assumes them.
 | Server | Directory | File name | Runner |
 | --- | --- | --- | --- |
 | `everything`, `filesystem`, `memory`, `sequentialthinking` | `src/<server>/__tests__/` | `<subject>.test.ts` | vitest, `globals: true` |
-| `fetch`, `git` | `src/<server>/tests/` | `test_<subject>.py` | pytest |
-| `time` | `src/time/test/` | `<subject>_test.py` | pytest |
+| `fetch`, `git`, `time` | `src/<server>/tests/` | `test_<subject>.py` | pytest |
 | Root tooling | `scripts/`, beside the script | `<name>.test.mjs` | `node --test` |
 
 Each vitest config includes only `**/__tests__/**/*.test.ts`, so a test file
@@ -216,7 +215,7 @@ than adding a dependency for one test.
 | Every TypeScript server | `npm test` at the root |
 | One TypeScript server's whole chain | `npm run validate -w src/<server>` (format check, lint, typecheck, build, test) |
 | One Python server | `uv run pytest` in `src/<server>` |
-| One Python test | `uv run pytest <path to the test file>::<name>` in `src/<server>` (for example `tests/test_server.py::test_git_checkout_existing_branch`, or `test/time_server_test.py::…` in `time`) |
+| One Python test | `uv run pytest <path to the test file>::<name>` in `src/<server>` (for example `tests/test_server.py::test_git_checkout_existing_branch`) |
 | One Python server's whole chain | `npm run validate:py -- <server>` |
 | Root tooling | `npm run test:scripts` |
 
