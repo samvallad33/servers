@@ -16,10 +16,10 @@ Driving a running server by hand, with the Inspector or an LLM client, is
 `/client-smoke`. It is evidence for a PR, not a substitute for a test.
 
 ⚠️ **The harnesses are uneven, and this page describes them as they are.** Only
-`everything` can be driven in-process today. A shared in-process harness for
-every server, and a per-file coverage threshold, are the work of #4854
-(TypeScript) and #4855 (Python); neither exists yet, and this skill changes
-when they land. Do not write a test that assumes them.
+`everything` and `time` can be driven in-process today. A shared in-process
+harness for every server, and an enforced per-file coverage threshold, are the
+work of #4854 (TypeScript) and #4855 (Python); neither is complete yet, and
+this skill changes when they land. Do not write a test that assumes them.
 
 ## Where a test goes
 
@@ -42,10 +42,10 @@ helpers go in `__tests__/` without the `.test` suffix, as
 | `filesystem` | Unit tests of `lib.ts` and the path helpers, plus an SDK `Client` over `StdioClientTransport` that spawns the built `dist/index.js` |
 | `sequentialthinking` | Unit tests of `lib.ts`, plus an SDK `Client` over stdio against `dist/index.js` |
 | `memory` | Direct calls on the exported `KnowledgeGraphManager` and `register…` functions, with a mocked server |
-| `fetch`, `git`, `time` | Direct calls on the functions in `server.py`, with `unittest.mock` |
+| `fetch`, `git` | Direct calls on the functions in `server.py`, with `unittest.mock` |
+| `time` | A `ClientSession` against `serve()` in-process, over in-memory streams (`tests/test_protocol.py`); direct calls on the helpers in `server.py` (`tests/test_server.py`) |
 
-No test in the repo uses an in-memory transport yet, and no Python test opens
-a `ClientSession`.
+Of the Python servers, only `time` opens a `ClientSession` in its tests.
 
 ## Choosing a harness for a new test
 
@@ -170,8 +170,11 @@ built".
 ### Python: `ClientSession` over stdio
 
 Each Python server constructs its `Server` inside `serve()`, so it cannot be
-handed to an in-memory session. A protocol-level test spawns the module and
-talks to it through the SDK's stdio client:
+handed to an in-memory session directly. `time` drives it in-process anyway, by
+patching `stdio_server` to yield the server side of
+`create_client_server_memory_streams()`; see the `serving()` helper in
+`src/time/tests/test_protocol.py`. The other route spawns the module and talks
+to it through the SDK's stdio client:
 
 ```python
 import sys
@@ -201,8 +204,8 @@ def test_get_current_time_over_stdio() -> None:
 and the install there is editable, so this runs your edit with no build step.
 
 How an async test is written differs by server, because the dev dependencies
-do: `fetch` has `pytest-asyncio` with `asyncio_mode = "auto"`, so an
-`async def test_…` just works. `git` and `time` do not have it; wrap the
+do: `fetch` and `time` have `pytest-asyncio` with `asyncio_mode = "auto"`,
+so an `async def test_…` just works. `git` does not have it; wrap the
 coroutine in `anyio.run(...)` as above (`git`'s `serve()` test does), rather
 than adding a dependency for one test.
 
@@ -236,8 +239,9 @@ npm run coverage                    # all four
 
 Today the report is **informational**. No vitest config sets a threshold, so
 `coverage` fails only when a test fails, and neither `validate` nor CI runs it.
-The Python servers have no coverage tooling at all: `pytest-cov` is not a dev
-dependency of any of them. Read the report to find what a change left
+Of the Python servers, only `time` has coverage tooling so far: its README's
+**Development** section gives the command, which writes `coverage.json`.
+Nothing enforces a threshold on it yet. Read the report to find what a change left
 untested; do not describe it as a gate.
 
 ⚠️ **A spawned server is invisible to the report.** v8 coverage measures the
