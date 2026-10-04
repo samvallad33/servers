@@ -37,8 +37,9 @@ in this order, and the first failure stops the run.
 | 2 | `validate` → `validate:guards` | The root guards, listed [below](#the-root-guards) | `typescript.yml` → **Root guards** |
 | 3 | `validate` → each workspace's `validate` | Per TypeScript server: `format:check`, `lint` (`--max-warnings 0`), `typecheck`, `build`, `test` | `typescript.yml` → **Validate \<server\>** (one leg each) |
 | 4 | `validate:py` | Per Python server: `uv sync --locked`, `ruff check`, `ruff format --check`, `pyright`, `pytest`, `uv build` | `python.yml` → **Test \<server\>** (one leg each) |
-| 5 | `verify:skills:cli` | `claude plugin validate` on `.claude/skills`, at the pinned CLI version | `typescript.yml` → **Root guards** |
-| 6 | `smoke` | Every server boots over each transport it implements and answers one tool call | `typescript.yml` → **Boot smoke** |
+| 5 | `coverage:py` | Per Python server: `uv sync --locked`, then `uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json`; then **every file** in `coverage.json` must reach **90% on lines and 90% on branches** | `python.yml` → **Coverage \<server\>** (one leg each) |
+| 6 | `verify:skills:cli` | `claude plugin validate` on `.claude/skills`, at the pinned CLI version | `typescript.yml` → **Root guards** |
+| 7 | `smoke` | Every server boots over each transport it implements and answers one tool call | `typescript.yml` → **Boot smoke** |
 
 Notes on the stages:
 
@@ -51,12 +52,23 @@ Notes on the stages:
 - **`validate:py` carries on after a failing server**, so one run reports all
   three verdicts, and exits non-zero if any failed. Within a server it stops
   at the first failing step.
+- **`coverage:py` is per file, not a total.** coverage.py's own `fail_under`
+  compares the sum across a package, so one well-tested module can carry an
+  untested one; `scripts/lib/py-coverage.mjs` reads `coverage.json` and checks
+  each file on its own. Lines and branches are the two dimensions coverage.py
+  measures (it has no function dimension); a file with no branches counts as
+  100% on them. What is measured is each server's `[tool.coverage.run]`
+  (`branch = true`, `source` set to its package). Like `validate:py` it carries
+  on after a failing server, and its summary names every file and dimension
+  below 90. It runs after `validate:py`, so a failing test has already been
+  reported on the fast, uninstrumented run.
 - **`verify:skills:cli` needs the network** when the pinned Claude Code CLI is
   not the one installed: it fetches it with `npx`. `validate:py` needs it too
   when a server's environment is missing or behind its lockfile, since
   `uv sync --locked` then downloads packages (and the pinned interpreter, if
-  `uv` does not have it). With warm caches those are the only two stages that
-  can fail offline.
+  `uv` does not have it); `coverage:py` begins with the same sync, which is a
+  no-op once `validate:py` has run. With warm caches those are the only stages
+  that can fail offline.
 - **`smoke` launches what a user launches**: the built `dist/index.js` for a
   TypeScript server, the console script through `uv run --no-sync` for a Python
   one. stdio for all seven; HTTP+SSE and Streamable HTTP as well for
@@ -92,9 +104,14 @@ covers: the repo-wide tooling and the guards that keep the gate itself honest.
   so it is in neither the gate nor CI. Run the whole suite when adding a skill
   or editing a description ([`skill-authoring.md`](./skill-authoring.md)).
 - **`npm run coverage`** runs each TypeScript server's tests instrumented and
-  prints a report. No threshold is enforced today. Per-file coverage thresholds,
-  and their stages in the gate and in CI, arrive with #4854 (TypeScript) and
-  #4855 (Python).
+  prints a report. No threshold is enforced on the TypeScript servers today;
+  their per-file thresholds, and their stages in the gate and in CI, arrive
+  with #4854. The Python servers' per-file gate is stage 5, `coverage:py`,
+  above: it is in both tiers, and it is the Python coverage command too, with
+  `npm run coverage:py -- <server>` for one server. It stays out of
+  `validate:py` and the plain `uv run pytest` loop on purpose, since an
+  instrumented run is slower and a per-file floor judges a finished change,
+  not each edit.
 - **`npm run pack:verify`** builds each package's publish artifact (the npm
   tarball, the wheel), installs it into an empty directory and boots the
   installed server. It catches what the boot smoke cannot, since the smoke

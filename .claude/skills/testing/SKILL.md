@@ -15,19 +15,19 @@ and which command runs what.
 Driving a running server by hand, with the Inspector or an LLM client, is
 `/client-smoke`. It is evidence for a PR, not a substitute for a test.
 
-⚠️ **The harnesses are uneven, and this page describes them as they are.** Only
-`everything` can be driven in-process today. A shared in-process harness for
-every server, and a per-file coverage threshold, are the work of #4854
-(TypeScript) and #4855 (Python); neither exists yet, and this skill changes
-when they land. Do not write a test that assumes them.
+⚠️ **The harnesses are uneven, and this page describes them as they are.** The
+three Python servers are driven in-process through a `ClientSession` and held
+to a per-file coverage gate (#4855). Of the TypeScript servers only
+`everything` can be driven in-process today, and none has a coverage
+threshold yet; both are the work of #4854, and the TypeScript half of this
+skill changes when it lands. Do not write a TypeScript test that assumes them.
 
 ## Where a test goes
 
 | Server | Directory | File name | Runner |
 | --- | --- | --- | --- |
 | `everything`, `filesystem`, `memory`, `sequentialthinking` | `src/<server>/__tests__/` | `<subject>.test.ts` | vitest, `globals: true` |
-| `fetch`, `git` | `src/<server>/tests/` | `test_<subject>.py` | pytest |
-| `time` | `src/time/test/` | `<subject>_test.py` | pytest |
+| `fetch`, `git`, `time` | `src/<server>/tests/` | `test_<subject>.py` | pytest, with `pytest-asyncio` (`asyncio_mode = "auto"`) |
 | Root tooling | `scripts/`, beside the script | `<name>.test.mjs` | `node --test` |
 
 Each vitest config includes only `**/__tests__/**/*.test.ts`, so a test file
@@ -43,10 +43,9 @@ helpers go in `__tests__/` without the `.test` suffix, as
 | `filesystem` | Unit tests of `lib.ts` and the path helpers, plus an SDK `Client` over `StdioClientTransport` that spawns the built `dist/index.js` |
 | `sequentialthinking` | Unit tests of `lib.ts`, plus an SDK `Client` over stdio against `dist/index.js` |
 | `memory` | Direct calls on the exported `KnowledgeGraphManager` and `register…` functions, with a mocked server |
-| `fetch`, `git`, `time` | Direct calls on the functions in `server.py`, with `unittest.mock` |
+| `fetch`, `git`, `time` | A `ClientSession` linked in-process to the real `serve()` over in-memory streams (below), plus direct calls on the pure functions in `server.py` |
 
-No test in the repo uses an in-memory transport yet, and no Python test opens
-a `ClientSession`.
+No TypeScript test uses an in-memory transport yet.
 
 ## Choosing a harness for a new test
 
@@ -168,44 +167,71 @@ the wire. The `filesystem` stdio tests and `memory`'s dist-layout test have no
 such guard and **fail**. A skipped test in this repo usually means "not
 built".
 
-### Python: `ClientSession` over stdio
+### Python: `ClientSession` over in-memory streams, in-process
 
-Each Python server constructs its `Server` inside `serve()`, so it cannot be
-handed to an in-memory session. A protocol-level test spawns the module and
-talks to it through the SDK's stdio client:
+Each Python server builds its `Server` inside `serve()` and serves it over the
+`stdio_server()` it imports into `server.py`. A test replaces that one name
+with a context manager that yields the server side of a pair of in-memory
+streams, runs the real `serve()` in a task group, and opens a `ClientSession`
+on the client side. No process, no build, and the SDK's input validation and
+error mapping run exactly as they do for a real client:
 
 ```python
-import sys
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 import anyio
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import pytest
+from mcp import ClientSession
+from mcp.shared.memory import create_client_server_memory_streams
+
+import mcp_server_time.server as server_module
 
 
-def test_get_current_time_over_stdio() -> None:
-    async def _run() -> None:
-        params = StdioServerParameters(
-            command=sys.executable, args=["-m", "mcp_server_time"]
-        )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "get_current_time", {"timezone": "UTC"}
-                )
-                assert result.isError is False
+@asynccontextmanager
+async def connect(**serve_kwargs: Any) -> AsyncIterator[ClientSession]:
+    async with create_client_server_memory_streams() as (client, server):
 
-    anyio.run(_run)
+        @asynccontextmanager
+        async def fake_stdio_server() -> AsyncIterator[Any]:
+            yield server
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(server_module, "stdio_server", fake_stdio_server)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(lambda: server_module.serve(**serve_kwargs))
+                async with ClientSession(*client) as session:
+                    await session.initialize()
+                    yield session
+                tg.cancel_scope.cancel()
+
+
+async def test_get_current_time() -> None:
+    async with connect() as session:
+        result = await session.call_tool("get_current_time", {"timezone": "UTC"})
+        assert result.isError is False
 ```
 
-`sys.executable` is the server's own virtual environment under `uv run pytest`,
-and the install there is editable, so this runs your edit with no build step.
+- **Patch the name `server.py` looks up** (`mcp_server_<name>.server.stdio_server`),
+  not `mcp.server.stdio.stdio_server`: `server.py` imported the function, so
+  the module attribute is what `serve()` calls.
+- **Cancel the task group after the session closes.** `serve()` runs until its
+  streams end, so without the cancel the test never returns.
+- **Assert on the wire shape where you can**, for example
+  `result.model_dump(by_alias=True, mode="json")`, rather than on Python
+  attribute names: the SDK v2 port (#4851) renames them, and a wire-level
+  assertion survives it.
+- **No network in a test.** `fetch` replaces `httpx.AsyncClient` with one on an
+  `httpx.MockTransport`; `git` works against a temporary repository its
+  fixture creates and closes before removing.
 
-How an async test is written differs by server, because the dev dependencies
-do: `fetch` has `pytest-asyncio` with `asyncio_mode = "auto"`, so an
-`async def test_…` just works. `git` and `time` do not have it; wrap the
-coroutine in `anyio.run(...)` as above (`git`'s `serve()` test does), rather
-than adding a dependency for one test.
+`pytest-asyncio` with `asyncio_mode = "auto"` is a dev dependency of all three,
+so an `async def test_…` runs as it stands.
+
+A subprocess test over stdio (`StdioServerParameters(command=sys.executable,
+args=["-m", "mcp_server_<name>"])` with `mcp.client.stdio.stdio_client`) is
+kept to a thin smoke of the entry point. coverage.py does not measure a child
+process, so code reached only that way reads as uncovered.
 
 ## Running them
 
@@ -216,8 +242,10 @@ than adding a dependency for one test.
 | Every TypeScript server | `npm test` at the root |
 | One TypeScript server's whole chain | `npm run validate -w src/<server>` (format check, lint, typecheck, build, test) |
 | One Python server | `uv run pytest` in `src/<server>` |
-| One Python test | `uv run pytest <path to the test file>::<name>` in `src/<server>` (for example `tests/test_server.py::test_git_checkout_existing_branch`, or `test/time_server_test.py::…` in `time`) |
+| One Python test | `uv run pytest <path to the test file>::<name>` in `src/<server>` (for example `tests/test_server.py::test_git_checkout_existing_branch`) |
 | One Python server's whole chain | `npm run validate:py -- <server>` |
+| One Python server's coverage gate | `npm run coverage:py -- <server>` at the root |
+| Every Python server's coverage gate | `npm run coverage:py` at the root |
 | Root tooling | `npm run test:scripts` |
 
 `npm run typecheck -w src/<server>` is the only step that typechecks the test
@@ -235,11 +263,29 @@ npm run coverage -w src/<server>    # one server
 npm run coverage                    # all four
 ```
 
-Today the report is **informational**. No vitest config sets a threshold, so
-`coverage` fails only when a test fails, and neither `validate` nor CI runs it.
-The Python servers have no coverage tooling at all: `pytest-cov` is not a dev
-dependency of any of them. Read the report to find what a change left
+For the TypeScript servers the report is **informational** today. No vitest
+config sets a threshold, so `coverage` fails only when a test fails, and
+neither `validate` nor CI runs it. Read the report to find what a change left
 untested; do not describe it as a gate.
+
+**The Python servers' coverage is a gate.** `npm run coverage:py -- <server>`
+runs, in `src/<server>`:
+
+```sh
+uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json
+```
+
+which prints coverage.py's report (the missing lines and partial branches)
+and writes `coverage.json` (ignored by git). `scripts/lib/py-coverage.mjs` then
+checks **every file** in it: at least 90% of its lines and 90% of its branches,
+each file on its own. What is measured is the server's `[tool.coverage.run]`
+(`branch = true`, `source` set to its package). `local:gate` and CI's
+**Coverage \<server\>** job both run it. It is kept out of the plain
+`uv run pytest` loop, which stays fast and uninstrumented.
+
+A line or branch that genuinely cannot run is marked
+`# pragma: no cover  # <reason>`, with the reason on the same line; never
+lower the gate. Diagnosing a red run is `/pre-push-gate`.
 
 ⚠️ **A spawned server is invisible to the report.** v8 coverage measures the
 vitest process, not a child it starts, so code reached only through a stdio

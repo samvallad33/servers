@@ -52,7 +52,7 @@ servers/
 │   └── time/                 Py  mcp-server-time                                  PyPI  Time and timezone conversion
 ├── .claude/skills/            On-demand procedures (see the Skills index above)
 ├── .changeset/               Pending changesets for the TypeScript servers, and the changesets config
-├── scripts/                  The pre-push gate (gate-lease, smoke-servers, validate-py), its guards (verify-*),
+├── scripts/                  The pre-push gate (gate-lease, smoke-servers, validate-py, coverage-py), its guards (verify-*),
 │                             the skills tooling, and release tooling (npm-publish-guard, prepare-python-release,
 │                             pack-and-verify, release-manifest)
 ├── docs/                     Design documents; quality-gate.md is the gate's reference (stages, CI vs local, the lease);
@@ -109,6 +109,7 @@ uv run pytest
 uv run --frozen pyright
 uv run ruff check .
 uv build
+npm run coverage:py -- <server>         # at the root: the per-file coverage gate
 
 # Both languages: the pre-push gate (see Before pushing)
 npm run local:gate
@@ -121,7 +122,8 @@ It runs every check CI runs, for both languages, in one command:
 `verify:install-fresh`, the root `validate` (the guards, then each TypeScript
 workspace's format check, lint, typecheck, build and tests), `validate:py`
 (each Python server's locked sync, `ruff check`, `ruff format --check`,
-pyright, pytest and build), `verify:skills:cli`, and `smoke` (every server
+pyright, pytest and build), `coverage:py` (each Python server's per-file
+coverage gate), `verify:skills:cli`, and `smoke` (every server
 booted over each transport it implements). The stage-by-stage reference, and
 what CI runs where, is [`docs/quality-gate.md`](./docs/quality-gate.md);
 diagnosing a red stage is the `pre-push-gate` skill.
@@ -450,9 +452,18 @@ here.
 
 - **New or changed behavior comes with tests.** TypeScript servers use
   **vitest** (with `@vitest/coverage-v8`), with tests in the server's
-  `__tests__/` directory. Python servers use **pytest** (`pytest-asyncio` where
-  the server is async), with tests in the server's `tests/` directory (`test/` in
-  `time`).
+  `__tests__/` directory. Python servers use **pytest** (with `pytest-asyncio`),
+  with tests in the server's `tests/` directory.
+- **Python: every file clears ≥ 90 per file on lines and on branches**, the
+  two dimensions coverage.py measures (it has no native function dimension).
+  Coverage is its own command, `npm run coverage:py` (`-- <server>` for one),
+  separate from the fast `uv run pytest` loop, and **CI enforces it** in a
+  parallel job, as `local:gate` does: a change that drops any Python file
+  below 90 on either dimension fails both.
+- **Genuinely unreachable Python code is marked at the source, never waved
+  through by lowering the gate**: `# pragma: no cover  # <reason>`, and every
+  pragma carries its reason. Reach for it only when the line or branch cannot
+  be exercised, not because a test is hard to write.
 - **Test at the protocol level where you can**: drive the server through an MCP
   client over an in-memory transport and assert on what comes back, rather than
   only calling internal functions.
